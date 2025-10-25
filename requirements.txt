@@ -1,0 +1,18 @@
+
+
+# HuggingFace & LLM utils
+transformers==4.43.0
+accelerate==1.11.0
+datasets==2.15.0
+tokenizers>=0.19
+datasets
+# Pour quantization 8-bit
+bitsandbytes==0.40.0
+
+# Multi-GPU / optimisations mémoire
+torchdata==0.10.1
+
+# Utilitaires
+numpy
+scipy
+tqdm

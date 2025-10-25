@@ -1,0 +1,8 @@
+{"datasets": 
+    [
+        {"name": "blended_skill_talk", "type":"dialog"},
+        {"name": "OpenAssistant/oasst1", "type":"dialog"},
+        {"name": "allenai/prosocial-dialog", "type":"dialog"},
+        {"name": "wikitext", "config": "wikitext-103-raw-v1", "type":"text"}
+    ]
+}
