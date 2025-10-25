@@ -17,10 +17,15 @@ if __name__ == "__main__":
     parser.add_argument("--model-name", type=str, default="model")
     parser.add_argument("--tokenizer-path", type=str, default="tokenizer.json")
     parser.add_argument("--config-path", type=str, default="config.json")
-    
+    parser.add_argument("--reset", action="store_true", help="Reset the model")
+
     args = parser.parse_args()
     
+        
     log_file = f"logs/{args.model_name}.log"
+    if args.reset:
+        os.remove(log_file)
+        os.remove(args.model_name)
     os.makedirs("logs", exist_ok=True)
 
     logging.basicConfig(
@@ -31,29 +36,36 @@ if __name__ == "__main__":
             logging.StreamHandler()
         ]
     )
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logging.info(f"Using device: {device}")
-
-datasets_path = {"train": "data/train.txt", "test": "data/test.txt", "val": "data/val.txt"}
-
-with open(args.config_path, "r") as f:
-    config = json.load(f)
+    file_logger = logging.getLogger("file_logger")
+    file_logger.setLevel(logging.INFO)
+    file_logger.propagate = False
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    file_logger.addHandler(file_handler)
     
-BATCH_SIZE = config["batch_size"]        
-SEQ_LEN = config["block_size"]           # block size
-EMBED_DIM = config["embed_dim"]         
-NUM_HEADS = config["num_heads"]       
-NUM_LAYERS = config["num_layers"]       
-MLP_RATIO = config["mlp_ratio"]     
-DROPOUT = config["dropout"]      
-VOCAB_SIZE = config["vocab_size"]     # size of vocab
-LR = config["lr"]          
-EPOCHS = config["epochs"]
+    with open(args.config_path, "r") as f:
+        config = json.load(f)
 
-if not args.tokenizer_path:
-    raise ValueError("Please provide a tokenizer path with --tokenizer-path")
-tokenizer = Tokenizer.from_file(args.tokenizer_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Using device: {device}")
+
+    datasets_path = {"train": "data/train.txt", "test": "data/test.txt", "val": "data/val.txt"}
+
+        
+    BATCH_SIZE = config["batch_size"]        
+    SEQ_LEN = config["block_size"]           # block size
+    EMBED_DIM = config["embed_dim"]         
+    NUM_HEADS = config["num_heads"]       
+    NUM_LAYERS = config["num_layers"]       
+    MLP_RATIO = config["mlp_ratio"]     
+    DROPOUT = config["dropout"]      
+    VOCAB_SIZE = config["vocab_size"]     # size of vocab
+    LR = config["lr"]          
+    EPOCHS = config["epochs"]
+
+    if not args.tokenizer_path:
+        raise ValueError("Please provide a tokenizer path with --tokenizer-path")
+    tokenizer = Tokenizer.from_file(args.tokenizer_path)
     
 class CausalSelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, block_size):
@@ -66,7 +78,7 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = embed_dim // num_heads # dimension of each head ex: embed_dim = 512 and num_heads = 8 -> head_dim = 64
         
         # linear projection to get each head's query/key/value
-        self.qvk_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
         
         # linear projection to get each head's output
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -182,23 +194,24 @@ class myTransformer(nn.Module):
             input_ids = torch.cat([input_ids, next_token], dim=1)
         return input_ids
 
-class TextDataset(torch.utils.data.Dataset):
+class StreamingDataset(torch.utils.data.IterableDataset):
     def __init__(self, path, tokenizer, block_size):
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
+        self.path = path
+        self.tokenizer = tokenizer
+        self.block_size = block_size
 
-        tokens = tokenizer.encode(text).ids
-        self.inputs = []
-        self.targets = []
-        for i in range(0, len(tokens) - block_size):
-            self.inputs.append(torch.tensor(tokens[i:i+block_size]))
-            self.targets.append(torch.tensor(tokens[i+1:i+block_size+1]))
+    def __iter__(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            buffer = []
+            for line in f:
+                tokens = self.tokenizer.encode(line.strip()).ids
+                buffer.extend(tokens)
+                while len(buffer) >= self.block_size + 1:
+                    x = torch.tensor(buffer[:self.block_size], dtype=torch.long)
+                    y = torch.tensor(buffer[1:self.block_size+1], dtype=torch.long)
+                    yield x, y
+                    buffer = buffer[1:]  # glissement de la fenêtre
 
-    def __len__(self):
-        return len(self.inputs)
-
-    def __getitem__(self, idx):
-        return self.inputs[idx], self.targets[idx]
 
             
 model = myTransformer(EMBED_DIM, NUM_HEADS, SEQ_LEN, VOCAB_SIZE, NUM_LAYERS, MLP_RATIO, DROPOUT)
@@ -208,9 +221,19 @@ model.to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 criterion = nn.CrossEntropyLoss() 
 
-train_loader = DataLoader(TextDataset(datasets_path["train"], tokenizer, SEQ_LEN), batch_size=BATCH_SIZE)
-val_loader = DataLoader(TextDataset(datasets_path["val"], tokenizer, SEQ_LEN), batch_size=BATCH_SIZE)
-test_loader = DataLoader(TextDataset(datasets_path["test"], tokenizer, SEQ_LEN), batch_size=BATCH_SIZE)
+train_loader = DataLoader(
+    StreamingDataset(datasets_path["train"], tokenizer, SEQ_LEN),
+    batch_size=BATCH_SIZE
+)
+val_loader = DataLoader(
+    StreamingDataset(datasets_path["val"], tokenizer, SEQ_LEN),
+    batch_size=BATCH_SIZE
+)
+test_loader = DataLoader(
+    StreamingDataset(datasets_path["test"], tokenizer, SEQ_LEN),
+    batch_size=BATCH_SIZE
+)
+
 
 def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, save_every=2):
     best_val_loss = float("inf")
@@ -230,16 +253,19 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, s
 
             running_loss += loss.item()
 
-            if (step + 1) % 100 == 0:
+            if (step + 1) % 5000 == 0:
                 avg_loss = running_loss / 100
-                logging.info(f"[Epoch {epoch}/{epochs}] Step {step+1}/{len(train_loader)} | Train loss: {avg_loss:.4f}")
+                tqdm.write(f"[Epoch {epoch}/{epochs}] Step {step+1} | Train loss: {avg_loss:.4f}")
+                file_logger.info(f"[Epoch {epoch}/{epochs}] Step {step+1} | Train loss: {avg_loss:.4f}")
                 running_loss = 0.0
                 
+            if (step + 1) % 20000 == 0 or step == 0:
                 generated = evaluate_prompt(model, tokenizer, EVAL_PROMPT, device)
                 os.makedirs(f"{args.model_name}", exist_ok=True)
-                with open(f"{args.model_name}/eval_prompts.txt", "a") as f:
+                with open(f"{args.model_name}/eval_prompts.txt", "a", encoding="utf-8") as f:
                     f.write(generated + "\n")
-                    logging.info(f"✅ Generated: {generated}")
+                    tqdm.write(f"✅ Generated: {generated}")
+                    file_logger.info(f"✅ Generated: {generated}")
 
         # Validation périodique
         val_loss = evaluate(model, val_loader, criterion, mode=f"Validation Epoch {epoch}")
@@ -280,9 +306,10 @@ def evaluate(model, dataloader, criterion, mode="Validation"):
 @torch.no_grad()
 def evaluate_prompt(model, tokenizer, eval_prompt, device, max_new_tokens=50):
     model.eval()
-    input_ids = tokenizer.encode(eval_prompt, return_tensors="pt").to(device)
+    ids = tokenizer.encode(eval_prompt).ids
+    input_ids = torch.tensor([ids], dtype=torch.long).to(device)
     out = model.generate(input_ids, max_new_tokens=max_new_tokens)
-    decoded = tokenizer.decode(out[0])
+    decoded = tokenizer.decode(out[0].tolist())
     return decoded
 
 
