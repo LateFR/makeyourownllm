@@ -1,29 +1,56 @@
+import json
 import math
+import os
+import time
 from tqdm import tqdm
 import torch
 import torch.nn as nn
 from tokenizers import Tokenizer
 import logging
 import argparse
+from torch.utils.data import DataLoader
+
+EVAL_PROMPT = "Once upon a time"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", type=str, default="model")
     parser.add_argument("--tokenizer-path", type=str, default="tokenizer.json")
+    parser.add_argument("--config-path", type=str, default="config.json")
     
     args = parser.parse_args()
     
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    datefmt="%m/%d/%Y %H:%M:%S",
-    level=logging.INFO,
-)
+    log_file = f"logs/{args.model_name}.log"
+    os.makedirs("logs", exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.info(f"Using device: {device}")
 
 datasets_path = {"train": "data/train.txt", "test": "data/test.txt", "val": "data/val.txt"}
+
+with open(args.config_path, "r") as f:
+    config = json.load(f)
     
+BATCH_SIZE = config["batch_size"]        
+SEQ_LEN = config["block_size"]           # block size
+EMBED_DIM = config["embed_dim"]         
+NUM_HEADS = config["num_heads"]       
+NUM_LAYERS = config["num_layers"]       
+MLP_RATIO = config["mlp_ratio"]     
+DROPOUT = config["dropout"]      
+VOCAB_SIZE = config["vocab_size"]     # size of vocab
+LR = config["lr"]          
+EPOCHS = config["epochs"]
+
 if not args.tokenizer_path:
     raise ValueError("Please provide a tokenizer path with --tokenizer-path")
 tokenizer = Tokenizer.from_file(args.tokenizer_path)
@@ -143,6 +170,17 @@ class myTransformer(nn.Module):
         x = self.lm_head(x) # (B, T, vocab_size)
         
         return x
+    
+    @torch.no_grad()
+    def generate(self, input_ids, max_new_tokens=50):
+        self.eval()
+        for _ in range(max_new_tokens):
+            logits = self.forward(input_ids)
+            probs = torch.softmax(logits[:, -1, :], dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+        return input_ids
 
 class TextDataset(torch.utils.data.Dataset):
     def __init__(self, path, tokenizer, block_size):
@@ -163,16 +201,6 @@ class TextDataset(torch.utils.data.Dataset):
         return self.inputs[idx], self.targets[idx]
 
             
-BATCH_SIZE = 4        # taille d'un batch
-SEQ_LEN = 64          # longueur de la séquence (block size)
-EMBED_DIM = 64        # dimension de l'embedding
-NUM_HEADS = 4         # nombre de têtes d'attention
-NUM_LAYERS = 2        # nombre de blocks transformer
-MLP_RATIO = 4.0       # ratio pour la dimension du MLP
-DROPOUT = 0.1         # dropout
-VOCAB_SIZE = 30000     # size of vocab
-LR = 3e-4             # learning rate
-EPOCHS = 10            # nombre d'époques
 model = myTransformer(EMBED_DIM, NUM_HEADS, SEQ_LEN, VOCAB_SIZE, NUM_LAYERS, MLP_RATIO, DROPOUT)
 model.to(device)
 
@@ -180,38 +208,93 @@ model.to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 criterion = nn.CrossEntropyLoss() 
 
-train_dataset = TextDataset("data/train.txt", tokenizer, SEQ_LEN)
-def train_model(model, dataloader, optimizer, criterion, EPOCHS):
-    for epoch in tqdm(range(EPOCHS)):
-        model.train() # mode train
+train_loader = DataLoader(TextDataset(datasets_path["train"], tokenizer, SEQ_LEN), batch_size=BATCH_SIZE)
+val_loader = DataLoader(TextDataset(datasets_path["val"], tokenizer, SEQ_LEN), batch_size=BATCH_SIZE)
+test_loader = DataLoader(TextDataset(datasets_path["test"], tokenizer, SEQ_LEN), batch_size=BATCH_SIZE)
+
+def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, save_every=2):
+    best_val_loss = float("inf")
+
+    for epoch in range(1, epochs + 1):
+        model.train()
         running_loss = 0.0
-        for step, (x, y) in enumerate(dataloader):
-            x = x.to(device)
-            y = y.to(device)
-            
+        start_time = time.time()
+
+        for step, (x, y) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")):
+            x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
-            
-            logits = model(x) # (B, T, vocab_size)
-            
-            # reshape and loss
+            logits = model(x)
             loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
-            
             loss.backward()
             optimizer.step()
-            
+
             running_loss += loss.item()
-            
-            if (step + 1) % 10 == 0:
-                tqdm.write(f"Epoch [{epoch+1}/{EPOCHS}] Step [{step+1}/{len(dataloader)}] Loss: {running_loss/10:.4f}")
+
+            if (step + 1) % 100 == 0:
+                avg_loss = running_loss / 100
+                logging.info(f"[Epoch {epoch}/{epochs}] Step {step+1}/{len(train_loader)} | Train loss: {avg_loss:.4f}")
                 running_loss = 0.0
+                
+                generated = evaluate_prompt(model, tokenizer, EVAL_PROMPT, device)
+                os.makedirs(f"{args.model_name}", exist_ok=True)
+                with open(f"{args.model_name}/eval_prompts.txt", "a") as f:
+                    f.write(generated + "\n")
+                    logging.info(f"✅ Generated: {generated}")
+
+        # Validation périodique
+        val_loss = evaluate(model, val_loader, criterion, mode=f"Validation Epoch {epoch}")
+        epoch_time = time.time() - start_time
+        logging.info(f"Epoch {epoch} done in {epoch_time:.1f}s | Val loss: {val_loss:.4f}")
+        
+        os.makedirs(f"{args.model_name}/checkpoints", exist_ok=True)
+
+        # Sauvegarde si amélioration
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            os.makedirs(f"{args.model_name}/checkpoints", exist_ok=True)
+            save_path = f"{args.model_name}/checkpoints/{args.model_name}_best.pt"
+            torch.save(model.state_dict(), save_path)
+            logging.info(f"✅ New best model saved: {save_path}")
+
+        # Sauvegarde périodique
+        if epoch % save_every == 0:
+            save_path = f"{args.model_name}/checkpoints/{args.model_name}_epoch{epoch}.pt"
+            torch.save(model.state_dict(), save_path)
+            logging.info(f"💾 Checkpoint saved: {save_path}")
                 
 @torch.no_grad()
 def evaluate(model, dataloader, criterion, mode="Validation"):
     model.eval()
-    total_loss = 0
-    for x, y in tqdm(dataloader, desc=mode):
+    total_loss = 0.0
+    count = 0
+    for x, y in dataloader:
         x, y = x.to(device), y.to(device)
         logits = model(x)
         loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
         total_loss += loss.item()
-    return total_loss / len(dataloader)
+        count += 1
+    avg_loss = total_loss / count
+    logging.info(f"[{mode}] Average loss: {avg_loss:.4f}")
+    return avg_loss
+
+@torch.no_grad()
+def evaluate_prompt(model, tokenizer, eval_prompt, device, max_new_tokens=50):
+    model.eval()
+    input_ids = tokenizer.encode(eval_prompt, return_tensors="pt").to(device)
+    out = model.generate(input_ids, max_new_tokens=max_new_tokens)
+    decoded = tokenizer.decode(out[0])
+    return decoded
+
+
+
+if __name__ == "__main__":
+    logging.info("Starting training...")
+    os.makedirs(f"{args.model_name}", exist_ok=True)
+    with open(f"{args.model_name}/config.json", "w") as f:
+        json.dump(config, f)
+    train_model(model, train_loader, val_loader, optimizer, criterion, EPOCHS)
+    logging.info("Evaluating on test set...")
+    evaluate(model, test_loader, criterion, "Test")
+    os.makedirs(f"{args.model_name}/checkpoints", exist_ok=True)
+    torch.save(model.state_dict(), f"{args.model_name}/checkpoints/{args.model_name}.pt")
+    logging.info("Training complete.")
