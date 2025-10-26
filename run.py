@@ -32,7 +32,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume-training", type=str, help="Resume training from a checkpoint. Can be: last, path to the directory checkpoints, or number of the epoch")
     parser.add_argument("--resume-from-epoch", type=int, help="Resume training from a specific epoch. If not specified, the script will try to ectract the epoch from the checkpoint name. If it can be found, it will resume from first epoch, so you can modify the config.json to reduce the epochs.")
     parser.add_argument("--train-seed", type=int, default=42, help="The seed to use for training")
-    
+    parser.add_argument("--workers", type=int, default=1, help="The number of workers to use for the streaming dataset")
     args = parser.parse_args()
     
         
@@ -68,7 +68,7 @@ if __name__ == "__main__":
     logging.info(f"Using device: {device}")
 
     
-    datasets_path = json.load(open(args.datasets_path, "r"))
+    datasets_path = json.load(open(args.dataset_config_path, "r"))
     if "train" not in datasets_path.keys() or "test" not in datasets_path.keys() or "val" not in datasets_path.keys():
         raise ValueError(f"Invalid datasets_path: {args.datasets_path}. Must be a json file with the keys 'train', 'test', and 'val'")
         
@@ -121,7 +121,7 @@ if __name__ == "__main__":
                 logging.warning(f"The tokenizer path ({args.tokenizer_path}) is different from the expected path ({args.model_name}/tokenizer.json). We'll use the specified tokenizer's path. Make sure you have the correct tokenizer.")
         else:
             logging.info(f"Moving tokenizer to {args.model_name}/tokenizer.json from {args.tokenizer_path} ...")
-            os.move(args.tokenizer_path, f"{args.model_name}/tokenizer.json")
+            shutil.move(args.tokenizer_path, f"{args.model_name}/tokenizer.json")
             logging.info(f"Tokenizer moved to {args.model_name}/tokenizer.json")
             args.tokenizer_path = f"{args.model_name}/tokenizer.json"
         
@@ -251,11 +251,10 @@ class myTransformer(nn.Module):
         return x
     
     @torch.no_grad()
-    def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k=50, top_p=0.95):
-        model.eval()
-        input_ids = torch.tensor([tokenizer.encode(prompt).ids], dtype=torch.long).to(device)
+    def generate(self, input_ids, max_new_tokens=50, temperature=1.0, top_k=50, top_p=0.95):
+        self.eval()
         for _ in range(max_new_tokens):
-            logits = model(input_ids)[:, -1, :] / temperature
+            logits = self(input_ids)[:, -1, :] / temperature
             probs = torch.softmax(logits, dim=-1)
             if top_k is not None:
                 values, _ = torch.topk(probs, top_k)
@@ -272,7 +271,12 @@ class myTransformer(nn.Module):
             input_ids = torch.cat([input_ids, next_token], dim=1)
         return tokenizer.decode(input_ids[0].tolist())
 
-
+def worker_init_fn(worker_id):
+    worker_seed = args.train_seed + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+    
 class StreamingDataset(torch.utils.data.IterableDataset):
     def __init__(self, path, tokenizer, block_size):
         self.path = path
@@ -280,28 +284,55 @@ class StreamingDataset(torch.utils.data.IterableDataset):
         self.block_size = block_size
 
     def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        start_line = 0
+        step = 1
+        if worker_info is not None:
+            # découper les lignes par worker
+            step = worker_info.num_workers
+            start_line = worker_info.id
         with open(self.path, "r", encoding="utf-8") as f:
             buffer = []
-            for line in f:
+            for idx, line in enumerate(f):
+                if (idx - start_line) % step != 0:
+                    continue
                 tokens = self.tokenizer.encode(line.strip()).ids
                 buffer.extend(tokens)
                 while len(buffer) >= self.block_size + 1:
                     x = torch.tensor(buffer[:self.block_size], dtype=torch.long)
                     y = torch.tensor(buffer[1:self.block_size+1], dtype=torch.long)
                     yield x, y
-                    buffer = buffer[1:]  # glissement de la fenêtre
+                    buffer = buffer[1:]
+def lr_lambda(step):
+    warmup = 2000
+    min_lr_scale = 0.1  
+
+    if step < warmup:
+        return step / warmup
+
+   
+    decay_rate = 0.000002 
+    cosine = 0.5 * (1 + math.cos(decay_rate * (step - warmup)))
+    return min_lr_scale + (1 - min_lr_scale) * cosine
+
                     
 train_loader = DataLoader(
     StreamingDataset(datasets_path["train"], tokenizer, SEQ_LEN),
-    batch_size=BATCH_SIZE
+    batch_size=BATCH_SIZE,
+    num_workers=args.workers,
+    worker_init_fn=worker_init_fn
 )
 val_loader = DataLoader(
     StreamingDataset(datasets_path["val"], tokenizer, SEQ_LEN),
-    batch_size=BATCH_SIZE
+    batch_size=BATCH_SIZE,
+    num_workers=args.workers,
+    worker_init_fn=worker_init_fn
 )
 test_loader = DataLoader(
     StreamingDataset(datasets_path["test"], tokenizer, SEQ_LEN),
-    batch_size=BATCH_SIZE
+    batch_size=BATCH_SIZE,
+    num_workers=args.workers,
+    worker_init_fn=worker_init_fn
 )
 
 if not args.resume_training:
@@ -313,7 +344,7 @@ if not args.resume_training:
     scaler = GradScaler(device=device)
     criterion = nn.CrossEntropyLoss() 
     
-    scheduler = CosineAnnealingLR(optimizer, T_max=len(train_loader)*EPOCHS, eta_min=1e-5)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda) 
 
 else:
     
@@ -353,7 +384,7 @@ else:
     model = myTransformer(EMBED_DIM, NUM_HEADS, SEQ_LEN, VOCAB_SIZE, NUM_LAYERS, MLP_RATIO, DROPOUT)
     model.load_state_dict(torch.load(f"{resume_checkpoint}/model.pt", map_location=device))
     optimizer = torch.load(f"{resume_checkpoint}/optimizer.pt", map_location=device)
-    scheduler = CosineAnnealingLR(optimizer, T_max=len(train_loader)*EPOCHS, eta_min=1e-5)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     scheduler.load_state_dict(torch.load(f"{resume_checkpoint}/scheduler.pt", map_location=device))
     logging.info(f"Checkpoints loaded from {resume_checkpoint}")
     logging.info(f"Resuming training from {resume_checkpoint}")
@@ -463,9 +494,8 @@ def evaluate_prompt(model, tokenizer, eval_prompt, device, max_new_tokens=50):
     if len(ids) > SEQ_LEN:
         ids = ids[-SEQ_LEN:] 
     input_ids = torch.tensor([ids], dtype=torch.long).to(device)
-    out = model.generate(input_ids, max_new_tokens=max_new_tokens)
-    decoded = tokenizer.decode(out[0].tolist())
-    return decoded
+    
+    return model.generate(input_ids, max_new_tokens=max_new_tokens)
 
 
 
