@@ -262,20 +262,23 @@ class myTransformer(nn.Module):
         for _ in range(max_new_tokens):
             logits = self(input_ids)[:, -1, :] / temperature
             probs = torch.softmax(logits, dim=-1)
-            if top_k is not None:
+            # top-k
+            if top_k is not None and top_k > 0:
                 values, _ = torch.topk(probs, top_k)
                 min_values = values[:, -1].unsqueeze(1)
                 probs = torch.where(probs < min_values, torch.zeros_like(probs), probs)
                 probs = probs / probs.sum(dim=-1, keepdim=True)
-            if top_p is not None:
+            # top-p (nucleus)
+            if top_p is not None and 0.0 < top_p < 1.0:
                 sorted_probs, sorted_idx = torch.sort(probs, descending=True)
                 cum_probs = torch.cumsum(sorted_probs, dim=-1)
-                sorted_probs[cum_probs > top_p] = 0
-                sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-                probs.scatter_(1, sorted_idx, sorted_probs)
+                sorted_probs[cum_probs > top_p] = 0.0
+                sorted_probs = sorted_probs / (sorted_probs.sum(dim=-1, keepdim=True) + 1e-12)
+                probs = torch.zeros_like(probs).scatter_(1, sorted_idx, sorted_probs)
             next_token = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_token], dim=1)
-        return tokenizer.decode(input_ids[0].tolist())
+        return input_ids  # retourne tensor d'ids
+
 
 def worker_init_fn(worker_id):
     worker_seed = args.train_seed + worker_id
@@ -314,7 +317,7 @@ def make_lr_lambda(warmup_steps=2000, total_steps=None, lr_scale_min=0.1):
     if total_steps is None:
         total_steps = warmup_steps + 200_000  # fallback (large)
 
-    def lr_lambda(step):
+    def _lambda(step):
         # step is 0-based number of scheduler.step() calls
         if step < warmup_steps:
             return float(step) / float(max(1, warmup_steps))
@@ -323,12 +326,11 @@ def make_lr_lambda(warmup_steps=2000, total_steps=None, lr_scale_min=0.1):
         cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
         return lr_scale_min + (1.0 - lr_scale_min) * cosine_decay
 
-    return lr_lambda
+    return _lambda
   
         
 def save_checkpoint(model, optimizer, scheduler, epoch, global_step, best_val_loss):
-    save_dir = f"{args.model_name}/checkpoints/"
-    shutil.rmtree(save_dir, ignore_errors=True)
+    save_dir = os.path.join(args.model_name, "checkpoints", str(epoch))
     os.makedirs(save_dir, exist_ok=True)
     torch.save(model.state_dict(), f"{save_dir}/model.pt")
     torch.save(optimizer.state_dict(), f"{save_dir}/optimizer.pt")
@@ -338,6 +340,18 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, best_val_lo
         json.dump(meta, f)
     logging.info(f"Checkpoint saved: {save_dir}")
     
+def load_checkpoint_for_resume(resume_checkpoint, model, optimizer, scheduler, device):
+    # resume_checkpoint is path to epoch_{N} directory
+    model.load_state_dict(torch.load(os.path.join(resume_checkpoint, "model.pt"), map_location=device))
+    optimizer.load_state_dict(torch.load(os.path.join(resume_checkpoint, "optimizer.pt"), map_location=device))
+    scheduler.load_state_dict(torch.load(os.path.join(resume_checkpoint, "scheduler.pt"), map_location=device))
+    meta_path = os.path.join(resume_checkpoint, "meta.json")
+    meta = {"epoch": 0, "global_step": 0, "best_val_loss": float("inf")}
+    if os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    return meta
+
 def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, global_step=0, best_val_loss=float("inf"), save_every=2):
     
     for epoch in range(1, epochs + 1):
@@ -435,7 +449,9 @@ def evaluate_prompt(model, tokenizer, eval_prompt, device, max_new_tokens=50):
         ids = ids[-SEQ_LEN:] 
     input_ids = torch.tensor([ids], dtype=torch.long).to(device)
     
-    return model.generate(input_ids, max_new_tokens=max_new_tokens)
+    result = model.generate(input_ids, max_new_tokens=max_new_tokens)
+    decoded = tokenizer.decode(result[0].tolist())
+    return decoded
 
 
 
@@ -460,14 +476,14 @@ if __name__ == "__main__":
         worker_init_fn=worker_init_fn
     )
 
+    
+    scaler = GradScaler(device=device)
+    criterion = nn.CrossEntropyLoss() 
+    
     if not args.resume_training:
         model = myTransformer(EMBED_DIM, NUM_HEADS, SEQ_LEN, VOCAB_SIZE, NUM_LAYERS, MLP_RATIO, DROPOUT)
         model.to(device)
-
-
         optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-        scaler = GradScaler(device=device)
-        criterion = nn.CrossEntropyLoss() 
         
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=make_lr_lambda(warmup_steps, total_steps, lr_scale_min))
 
@@ -495,22 +511,19 @@ if __name__ == "__main__":
             raise ValueError(f"Checkpoints not found in {resume_checkpoint}. Make sure you have run the training script before and want to resume from checkpoints. Need: optimizer.pt, scheduler.pt, model.pt")
         
         
-        with open(os.path.join(resume_checkpoint, "meta.json"), "r", encoding="utf-8") as f:
-            meta = json.load(f)
-            global_step = meta["global_step"]
-            best_val_loss = meta["best_val_loss"]
-            epoch = meta["epoch"]
             
-            EPOCHS = EPOCHS - epoch + 1
-            logging.info(f"Resuming training from epoch {epoch}. EPOCHS set to {EPOCHS - epoch + 1} so stay {EPOCHS} epochs to train")
+        model = myTransformer(EMBED_DIM, NUM_HEADS, SEQ_LEN, VOCAB_SIZE, NUM_LAYERS, MLP_RATIO, DROPOUT)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=make_lr_lambda(warmup_steps, total_steps, lr_scale_min))
+        meta = load_checkpoint_for_resume(resume_checkpoint, model, optimizer, scheduler, device)
+        global_step = meta.get("global_step", 0)
+        best_val_loss = meta.get("best_val_loss", float("inf"))
+        epoch = meta.get("epoch", 0)
+        EPOCHS = EPOCHS - epoch + 1
+        logging.info(f"Resuming training from epoch {epoch}. EPOCHS set to {EPOCHS - epoch + 1} so stay {EPOCHS} epochs to train")
         
-    model = myTransformer(EMBED_DIM, NUM_HEADS, SEQ_LEN, VOCAB_SIZE, NUM_LAYERS, MLP_RATIO, DROPOUT)
-    model.load_state_dict(torch.load(f"{resume_checkpoint}/model.pt", map_location=device))
-    optimizer = torch.load(f"{resume_checkpoint}/optimizer.pt", map_location=device)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=make_lr_lambda(warmup_steps, total_steps, lr_scale_min))
-    scheduler.load_state_dict(torch.load(f"{resume_checkpoint}/scheduler.pt", map_location=device))
-    logging.info(f"Checkpoints loaded from {resume_checkpoint}")
-    logging.info(f"Resuming training from {resume_checkpoint}")
+        logging.info(f"Checkpoints loaded from {resume_checkpoint}")
+        logging.info(f"Resuming training from {resume_checkpoint}")
     
     logging.info("Starting training...")
     os.makedirs(f"{args.model_name}", exist_ok=True)
