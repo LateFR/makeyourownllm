@@ -236,15 +236,27 @@ class myTransformer(nn.Module):
         return x
     
     @torch.no_grad()
-    def generate(self, input_ids, max_new_tokens=50):
-        self.eval()
+    def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k=50, top_p=0.95):
+        model.eval()
+        input_ids = torch.tensor([tokenizer.encode(prompt).ids], dtype=torch.long).to(device)
         for _ in range(max_new_tokens):
-            logits = self.forward(input_ids)
-            probs = torch.softmax(logits[:, -1, :], dim=-1)
+            logits = model(input_ids)[:, -1, :] / temperature
+            probs = torch.softmax(logits, dim=-1)
+            if top_k is not None:
+                values, _ = torch.topk(probs, top_k)
+                min_values = values[:, -1].unsqueeze(1)
+                probs = torch.where(probs < min_values, torch.zeros_like(probs), probs)
+                probs = probs / probs.sum(dim=-1, keepdim=True)
+            if top_p is not None:
+                sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+                cum_probs = torch.cumsum(sorted_probs, dim=-1)
+                sorted_probs[cum_probs > top_p] = 0
+                sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+                probs.scatter_(1, sorted_idx, sorted_probs)
             next_token = torch.multinomial(probs, num_samples=1)
-
             input_ids = torch.cat([input_ids, next_token], dim=1)
-        return input_ids
+        return tokenizer.decode(input_ids[0].tolist())
+
 
 class StreamingDataset(torch.utils.data.IterableDataset):
     def __init__(self, path, tokenizer, block_size):
@@ -289,6 +301,8 @@ if not args.resume_training:
     scheduler = CosineAnnealingLR(optimizer, T_max=len(train_loader)*EPOCHS, eta_min=1e-5)
 
 else:
+    
+    
     if args.resume_training == "last":
         checkpoints = os.listdir(f"{args.model_name}/checkpoints")
         if not checkpoints:
@@ -308,13 +322,7 @@ else:
     
     if not os.path.exists(f"{resume_checkpoint}/optimizer.pt") or not os.path.exists(f"{resume_checkpoint}/scheduler.pt") or not os.path.exists(f"{resume_checkpoint}/model.pt"):
         raise ValueError(f"Checkpoints not found in {resume_checkpoint}. Make sure you have run the training script before and want to resume from checkpoints. Need: optimizer.pt, scheduler.pt, model.pt")
-    model = myTransformer(EMBED_DIM, NUM_HEADS, SEQ_LEN, VOCAB_SIZE, NUM_LAYERS, MLP_RATIO, DROPOUT)
-    model.load_state_dict(torch.load(f"{resume_checkpoint}/model.pt", map_location=device))
-    optimizer = torch.load(f"{resume_checkpoint}/optimizer.pt", map_location=device)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: min((step + 1) / 2000, 1.0))  # warmup on 2000 steps
-    scheduler.load_state_dict(torch.load(f"{resume_checkpoint}/scheduler.pt", map_location=device))
-    logging.info(f"Checkpoints loaded from {resume_checkpoint}")
-    logging.info(f"Resuming training from {resume_checkpoint}")
+    
     
     if args.resume_from_epoch:
         EPOCHS = EPOCHS - args.resume_from_epoch + 1
@@ -326,6 +334,15 @@ else:
         else:
             EPOCHS = EPOCHS - epoch + 1
             logging.info(f"Resuming training from epoch {epoch}. EPOCHS set to {EPOCHS - epoch + 1} so stay {EPOCHS} epochs to train")
+            
+    model = myTransformer(EMBED_DIM, NUM_HEADS, SEQ_LEN, VOCAB_SIZE, NUM_LAYERS, MLP_RATIO, DROPOUT)
+    model.load_state_dict(torch.load(f"{resume_checkpoint}/model.pt", map_location=device))
+    optimizer = torch.load(f"{resume_checkpoint}/optimizer.pt", map_location=device)
+    scheduler = CosineAnnealingLR(optimizer, T_max=len(train_loader)*EPOCHS, eta_min=1e-5)
+    scheduler.load_state_dict(torch.load(f"{resume_checkpoint}/scheduler.pt", map_location=device))
+    logging.info(f"Checkpoints loaded from {resume_checkpoint}")
+    logging.info(f"Resuming training from {resume_checkpoint}")
+    
         
 def save_checkpoint(model, optimizer, scheduler, epoch):
     save_dir = f"{args.model_name}/checkpoints/"
