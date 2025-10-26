@@ -131,8 +131,14 @@ if __name__ == "__main__":
         logging.warning(f"The tokenizer vocab size ({tokenizer_vocab_size}) is different from the expected vocab size ({VOCAB_SIZE}). We'll use the tokenizer's vocab size.")
         VOCAB_SIZE = tokenizer_vocab_size
     
+    warmup_steps = config.get("warmup_steps", 2000)
+    total_steps = config.get("total_steps", None)
+    lr_scale_min = config.get("lr_scale_min", 0.1)
+    best_val_loss = float("inf")
+    global_step = 0
+
     
-LOG_EVERY = 500
+    LOG_EVERY = 500
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, block_size):
@@ -303,104 +309,37 @@ class StreamingDataset(torch.utils.data.IterableDataset):
                     y = torch.tensor(buffer[1:self.block_size+1], dtype=torch.long)
                     yield x, y
                     buffer = buffer[1:]
-def lr_lambda(step):
-    warmup = 2000
-    min_lr_scale = 0.1  
 
-    if step < warmup:
-        return step / warmup
+def make_lr_lambda(warmup_steps=2000, total_steps=None, lr_scale_min=0.1):
+    if total_steps is None:
+        total_steps = warmup_steps + 200_000  # fallback (large)
 
-   
-    decay_rate = 0.000002 
-    cosine = 0.5 * (1 + math.cos(decay_rate * (step - warmup)))
-    return min_lr_scale + (1 - min_lr_scale) * cosine
+    def lr_lambda(step):
+        # step is 0-based number of scheduler.step() calls
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        progress = min(float(step - warmup_steps) / float(max(1, total_steps - warmup_steps)), 1.0)
+        # cosine decay from 1.0 -> lr_scale_min
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return lr_scale_min + (1.0 - lr_scale_min) * cosine_decay
 
-                    
-train_loader = DataLoader(
-    StreamingDataset(datasets_path["train"], tokenizer, SEQ_LEN),
-    batch_size=BATCH_SIZE,
-    num_workers=args.workers,
-    worker_init_fn=worker_init_fn
-)
-val_loader = DataLoader(
-    StreamingDataset(datasets_path["val"], tokenizer, SEQ_LEN),
-    batch_size=BATCH_SIZE,
-    num_workers=args.workers,
-    worker_init_fn=worker_init_fn
-)
-test_loader = DataLoader(
-    StreamingDataset(datasets_path["test"], tokenizer, SEQ_LEN),
-    batch_size=BATCH_SIZE,
-    num_workers=args.workers,
-    worker_init_fn=worker_init_fn
-)
-
-if not args.resume_training:
-    model = myTransformer(EMBED_DIM, NUM_HEADS, SEQ_LEN, VOCAB_SIZE, NUM_LAYERS, MLP_RATIO, DROPOUT)
-    model.to(device)
-
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-    scaler = GradScaler(device=device)
-    criterion = nn.CrossEntropyLoss() 
-    
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda) 
-
-else:
-    
-    
-    if args.resume_training == "last":
-        checkpoints = os.listdir(f"{args.model_name}/checkpoints")
-        if not checkpoints:
-            raise ValueError(f"No checkpoints found in {args.model_name}/checkpoints")
-        latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("_")[-1].split(".")[0]))
-        resume_checkpoint = f"{args.model_name}/checkpoints/{latest_checkpoint}"
-        logging.info(f"Resuming training from {resume_checkpoint}")
-    elif args.resume_training.isdigit():
-        resume_checkpoint = f"{args.model_name}/checkpoints/{args.resume_training}"
-        if not os.path.exists(resume_checkpoint):
-            raise ValueError(f"Checkpoint {resume_checkpoint} not found")
-        logging.info(f"Resuming training from {resume_checkpoint}")
-    elif os.path.isdir(args.resume_training):
-        resume_checkpoint = args.resume_training
-    else:
-        raise ValueError(f"Invalid resume_training argument: {args.resume_training}. Must be 'last', the number of the last checkpoint, or a directory containing a checkpoint.")
-    
-    if not os.path.exists(f"{resume_checkpoint}/optimizer.pt") or not os.path.exists(f"{resume_checkpoint}/scheduler.pt") or not os.path.exists(f"{resume_checkpoint}/model.pt"):
-        raise ValueError(f"Checkpoints not found in {resume_checkpoint}. Make sure you have run the training script before and want to resume from checkpoints. Need: optimizer.pt, scheduler.pt, model.pt")
-    
-    
-    if args.resume_from_epoch:
-        EPOCHS = EPOCHS - args.resume_from_epoch + 1
-        logging.info(f"Resuming training from epoch {args.resume_from_epoch}. EPOCHS set to {EPOCHS + args.resume_from_epoch - 1} so stay {EPOCHS} epochs to train")
-    else:
-        epoch = int(resume_checkpoint.split("_")[-1].split(".")[0])
-        if not epoch:
-            logging.warning(f"Could not extract epoch from checkpoint name {resume_checkpoint}. Will resume from first epoch. Not bad but can produce overfitting.")
-        else:
-            EPOCHS = EPOCHS - epoch + 1
-            logging.info(f"Resuming training from epoch {epoch}. EPOCHS set to {EPOCHS - epoch + 1} so stay {EPOCHS} epochs to train")
-            
-    model = myTransformer(EMBED_DIM, NUM_HEADS, SEQ_LEN, VOCAB_SIZE, NUM_LAYERS, MLP_RATIO, DROPOUT)
-    model.load_state_dict(torch.load(f"{resume_checkpoint}/model.pt", map_location=device))
-    optimizer = torch.load(f"{resume_checkpoint}/optimizer.pt", map_location=device)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-    scheduler.load_state_dict(torch.load(f"{resume_checkpoint}/scheduler.pt", map_location=device))
-    logging.info(f"Checkpoints loaded from {resume_checkpoint}")
-    logging.info(f"Resuming training from {resume_checkpoint}")
-    
+    return lr_lambda
+  
         
-def save_checkpoint(model, optimizer, scheduler, epoch):
+def save_checkpoint(model, optimizer, scheduler, epoch, global_step, best_val_loss):
     save_dir = f"{args.model_name}/checkpoints/"
+    shutil.rmtree(save_dir, ignore_errors=True)
     os.makedirs(save_dir, exist_ok=True)
     torch.save(model.state_dict(), f"{save_dir}/model.pt")
     torch.save(optimizer.state_dict(), f"{save_dir}/optimizer.pt")
     torch.save(scheduler.state_dict(), f"{save_dir}/scheduler.pt")
-    logging.info(f"Checkpoint saved: {save_dir}/{args.model_name}_epoch{epoch}.pt")
+    meta = {"epoch": epoch, "global_step": global_step, "best_val_loss": best_val_loss}
+    with open(os.path.join(save_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+    logging.info(f"Checkpoint saved: {save_dir}")
     
-def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, save_every=2):
-    best_val_loss = float("inf")
-
+def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, global_step=0, best_val_loss=float("inf"), save_every=2):
+    
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
@@ -438,6 +377,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, s
             scaler.update()
             scheduler.step()
 
+            global_step += 1
             running_loss += float(loss.detach().item())
 
             if (step + 1) % LOG_EVERY == 0:
@@ -464,12 +404,12 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, s
         # Sauvegarde si amélioration
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_checkpoint(model, optimizer, scheduler, epoch)
+            save_checkpoint(model, optimizer, scheduler, epoch, global_step, best_val_loss)
             logging.info(f"✅ New best model saved")
 
         # Sauvegarde périodique
         if epoch % save_every == 0:
-            save_checkpoint(model, optimizer, scheduler, epoch)
+            save_checkpoint(model, optimizer, scheduler, epoch, global_step, best_val_loss)
             logging.info(f"💾 Checkpoint saved")
                 
 @torch.no_grad()
@@ -500,11 +440,83 @@ def evaluate_prompt(model, tokenizer, eval_prompt, device, max_new_tokens=50):
 
 
 if __name__ == "__main__":
+                      
+    train_loader = DataLoader(
+        StreamingDataset(datasets_path["train"], tokenizer, SEQ_LEN),
+        batch_size=BATCH_SIZE,
+        num_workers=args.workers,
+        worker_init_fn=worker_init_fn
+    )
+    val_loader = DataLoader(
+        StreamingDataset(datasets_path["val"], tokenizer, SEQ_LEN),
+        batch_size=BATCH_SIZE,
+        num_workers=args.workers,
+        worker_init_fn=worker_init_fn
+    )
+    test_loader = DataLoader(
+        StreamingDataset(datasets_path["test"], tokenizer, SEQ_LEN),
+        batch_size=BATCH_SIZE,
+        num_workers=args.workers,
+        worker_init_fn=worker_init_fn
+    )
+
+    if not args.resume_training:
+        model = myTransformer(EMBED_DIM, NUM_HEADS, SEQ_LEN, VOCAB_SIZE, NUM_LAYERS, MLP_RATIO, DROPOUT)
+        model.to(device)
+
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+        scaler = GradScaler(device=device)
+        criterion = nn.CrossEntropyLoss() 
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=make_lr_lambda(warmup_steps, total_steps, lr_scale_min))
+
+    else:
+        
+        
+        if args.resume_training == "last":
+            checkpoints = os.listdir(f"{args.model_name}/checkpoints")
+            if not checkpoints:
+                raise ValueError(f"No checkpoints found in {args.model_name}/checkpoints")
+            latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("_")[-1].split(".")[0]))
+            resume_checkpoint = f"{args.model_name}/checkpoints/{latest_checkpoint}"
+            logging.info(f"Resuming training from {resume_checkpoint}")
+        elif args.resume_training.isdigit():
+            resume_checkpoint = f"{args.model_name}/checkpoints/{args.resume_training}"
+            if not os.path.exists(resume_checkpoint):
+                raise ValueError(f"Checkpoint {resume_checkpoint} not found")
+            logging.info(f"Resuming training from {resume_checkpoint}")
+        elif os.path.isdir(args.resume_training):
+            resume_checkpoint = args.resume_training
+        else:
+            raise ValueError(f"Invalid resume_training argument: {args.resume_training}. Must be 'last', the number of the last checkpoint, or a directory containing a checkpoint.")
+        
+        if not os.path.exists(f"{resume_checkpoint}/optimizer.pt") or not os.path.exists(f"{resume_checkpoint}/scheduler.pt") or not os.path.exists(f"{resume_checkpoint}/model.pt"):
+            raise ValueError(f"Checkpoints not found in {resume_checkpoint}. Make sure you have run the training script before and want to resume from checkpoints. Need: optimizer.pt, scheduler.pt, model.pt")
+        
+        
+        with open(os.path.join(resume_checkpoint, "meta.json"), "r", encoding="utf-8") as f:
+            meta = json.load(f)
+            global_step = meta["global_step"]
+            best_val_loss = meta["best_val_loss"]
+            epoch = meta["epoch"]
+            
+            EPOCHS = EPOCHS - epoch + 1
+            logging.info(f"Resuming training from epoch {epoch}. EPOCHS set to {EPOCHS - epoch + 1} so stay {EPOCHS} epochs to train")
+        
+    model = myTransformer(EMBED_DIM, NUM_HEADS, SEQ_LEN, VOCAB_SIZE, NUM_LAYERS, MLP_RATIO, DROPOUT)
+    model.load_state_dict(torch.load(f"{resume_checkpoint}/model.pt", map_location=device))
+    optimizer = torch.load(f"{resume_checkpoint}/optimizer.pt", map_location=device)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=make_lr_lambda(warmup_steps, total_steps, lr_scale_min))
+    scheduler.load_state_dict(torch.load(f"{resume_checkpoint}/scheduler.pt", map_location=device))
+    logging.info(f"Checkpoints loaded from {resume_checkpoint}")
+    logging.info(f"Resuming training from {resume_checkpoint}")
+    
     logging.info("Starting training...")
     os.makedirs(f"{args.model_name}", exist_ok=True)
     with open(f"{args.model_name}/config.json", "w") as f:
         json.dump(config, f)
-    train_model(model, train_loader, val_loader, optimizer, criterion, EPOCHS)
+    train_model(model, train_loader, val_loader, optimizer, criterion, EPOCHS, global_step, best_val_loss)
     logging.info("Evaluating on test set...")
     evaluate(model, test_loader, criterion, "Test")
     os.makedirs(f"{args.model_name}/checkpoints", exist_ok=True)
