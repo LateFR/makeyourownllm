@@ -9,6 +9,7 @@ from tokenizers import Tokenizer
 import logging
 import argparse
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
 
 EVAL_PROMPT = "Once upon a time"
 
@@ -46,7 +47,7 @@ if __name__ == "__main__":
     with open(args.config_path, "r") as f:
         config = json.load(f)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info(f"Using device: {device}")
 
     datasets_path = {"train": "data/train.txt", "test": "data/test.txt", "val": "data/val.txt"}
@@ -219,7 +220,15 @@ model.to(device)
 
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+scaler = GradScaler(device=device)
 criterion = nn.CrossEntropyLoss() 
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(
+    optimizer,
+    lr_lambda=lambda step: min((step + 1) / 2000, 1.0)  # warmup on 2000 steps
+)
+
+
 
 train_loader = DataLoader(
     StreamingDataset(datasets_path["train"], tokenizer, SEQ_LEN),
@@ -246,9 +255,14 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, s
         for step, (x, y) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")):
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
-            logits = model(x)
-            loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
-            loss.backward()
+            with autocast(device_type=device): # fp16
+                logits = model(x)
+                loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.step()
 
             running_loss += loss.item()
