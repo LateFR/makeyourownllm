@@ -13,8 +13,13 @@ import logging
 import argparse
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
-from torch.optim.lr_scheduler import CosineAnnealingLR
-
+logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.StreamHandler()
+        ]
+    )
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", type=str, default="model")
@@ -25,18 +30,19 @@ if __name__ == "__main__":
     parser.add_argument("--import-datasets", action="store_true", help="This will import the datasets from the datasets.json file, (downloading them from hungging face if necessary). Automatically called if --generate-tokenizer or --merge-datasets is used")
     parser.add_argument("--merge-datasets", action="store_true", help="This will merge the datasets into 3 single files (train.txt, test.txt, val.txt). Needs to be run after importing datasets")
     parser.add_argument("--dataset-config-path", type=str, default="datasets.json", help="Path to the dataset configuration file")
-    parser.add_argument("--dataset-path", type=str, default="data", help="Path to the dataset directory")
+    parser.add_argument("--dataset-path", type=str, default="cleans_datasets_path.json", help="Path to the json file containing the dataset paths")
     parser.add_argument("--dont-move-tokenizer", action="store_true", help="Don't move the tokenizer to the model directory")
     parser.add_argument("--eval-prompt", type=str, default="Once upon a time", help="The prompt to use for evaluation")
     parser.add_argument("--eval-max-new-tokens", type=int, default=50, help="The maximum number of new tokens to generate for evaluation")
     parser.add_argument("--resume-training", type=str, help="Resume training from a checkpoint. Can be: last, path to the directory checkpoints, or number of the epoch")
     parser.add_argument("--resume-from-epoch", type=int, help="Resume training from a specific epoch. If not specified, the script will try to ectract the epoch from the checkpoint name. If it can be found, it will resume from first epoch, so you can modify the config.json to reduce the epochs.")
     parser.add_argument("--train-seed", type=int, default=42, help="The seed to use for training")
-    parser.add_argument("--workers", type=int, default=1, help="The number of workers to use for the streaming dataset")
+    parser.add_argument("--workers", type=int, default=0, help="The number of workers to use for the streaming dataset")
     args = parser.parse_args()
     
-        
+    
     log_file = f"logs/{args.model_name}.log"
+    logging.FileHandler(log_file)
     if args.reset:
         if os.path.exists(log_file):
             os.remove(log_file)
@@ -45,15 +51,8 @@ if __name__ == "__main__":
             shutil.rmtree(args.model_name, ignore_errors=True)
             logging.info(f"Model {args.model_name} deleted")
     os.makedirs("logs", exist_ok=True)
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
+    os.makedirs(args.model_name, exist_ok=True)
+    
     file_logger = logging.getLogger("file_logger")
     file_logger.setLevel(logging.INFO)
     file_logger.propagate = False
@@ -68,9 +67,9 @@ if __name__ == "__main__":
     logging.info(f"Using device: {device}")
 
     
-    datasets_path = json.load(open(args.dataset_config_path, "r"))
+    datasets_path = json.load(open(args.dataset_path, "r"))
     if "train" not in datasets_path.keys() or "test" not in datasets_path.keys() or "val" not in datasets_path.keys():
-        raise ValueError(f"Invalid datasets_path: {args.datasets_path}. Must be a json file with the keys 'train', 'test', and 'val'")
+        raise ValueError(f"Invalid datasets_path: {args.dataset_path}. Must be a json file with the keys 'train', 'test', and 'val'")
         
     BATCH_SIZE = config["batch_size"]        
     SEQ_LEN = config["block_size"]           # block size
@@ -102,7 +101,7 @@ if __name__ == "__main__":
     if args.generate_tokenizer:
         import dataset_manager
         import train_tokenizer
-        dataset_manager.import_datasets(args.dataset_path)
+        dataset_manager.import_datasets(args.dataset_config_path)
         
         train_tokenizer.train_tokenizer(args.tokenizer_path, VOCAB_SIZE)
         
@@ -112,7 +111,7 @@ if __name__ == "__main__":
     if args.merge_datasets:
         if not dataset_manager.data_instances:
             dataset_manager.import_datasets(args.dataset_config_path)
-        dataset_manager.merge_and_write_datasets(args.dataset_path)
+        dataset_manager.merge_and_write_datasets("data")
         
     if not args.dont_move_tokenizer:
         if os.path.exists(f"{args.model_name}/tokenizer.json"):
@@ -120,8 +119,8 @@ if __name__ == "__main__":
             if args.tokenizer_path != f"{args.model_name}/tokenizer.json":
                 logging.warning(f"The tokenizer path ({args.tokenizer_path}) is different from the expected path ({args.model_name}/tokenizer.json). We'll use the specified tokenizer's path. Make sure you have the correct tokenizer.")
         else:
-            logging.info(f"Moving tokenizer to {args.model_name}/tokenizer.json from {args.tokenizer_path} ...")
-            shutil.move(args.tokenizer_path, f"{args.model_name}/tokenizer.json")
+            logging.info(f"Copying tokenizer to {args.model_name}/tokenizer.json from {args.tokenizer_path} ...")
+            shutil.copy(args.tokenizer_path, f"{args.model_name}/tokenizer.json")
             logging.info(f"Tokenizer moved to {args.model_name}/tokenizer.json")
             args.tokenizer_path = f"{args.model_name}/tokenizer.json"
         
@@ -259,32 +258,70 @@ class myTransformer(nn.Module):
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens=50, temperature=1.0, top_k=50, top_p=0.95):
         self.eval()
+        vocab_size = self.token_embedding.num_embeddings
+        block_size = self.pos_embedding.num_embeddings
+        
         for _ in range(max_new_tokens):
-            logits = self(input_ids)[:, -1, :] / temperature
+            context = input_ids if input_ids.size(1) <= block_size else input_ids[:, -block_size:]
+            
+            logits = self(context)[:, -1, :] / temperature
+            
+            # Check for NaN/Inf in the logits
+            if not torch.isfinite(logits).all():
+                break
+                
             probs = torch.softmax(logits, dim=-1)
+            
             # top-k
             if top_k is not None and top_k > 0:
-                values, _ = torch.topk(probs, top_k)
+                top_k_clamped = min(top_k, vocab_size)
+                values, _ = torch.topk(probs, top_k_clamped)
                 min_values = values[:, -1].unsqueeze(1)
                 probs = torch.where(probs < min_values, torch.zeros_like(probs), probs)
-                probs = probs / probs.sum(dim=-1, keepdim=True)
-            # top-p (nucleus)
+                
+                # CRITIQUE : Check that the sum is not null
+                prob_sum = probs.sum(dim=-1, keepdim=True)
+                if (prob_sum < 1e-10).any():
+                    # Fallback : reset to a uniform distribution over top-k
+                    probs = torch.where(probs > 0, torch.ones_like(probs), torch.zeros_like(probs))
+                    prob_sum = probs.sum(dim=-1, keepdim=True)
+                probs = probs / prob_sum
+            
+            # top-p
             if top_p is not None and 0.0 < top_p < 1.0:
                 sorted_probs, sorted_idx = torch.sort(probs, descending=True)
                 cum_probs = torch.cumsum(sorted_probs, dim=-1)
                 sorted_probs[cum_probs > top_p] = 0.0
-                sorted_probs = sorted_probs / (sorted_probs.sum(dim=-1, keepdim=True) + 1e-12)
+                
+                # CRITICAL: Check that the sum is not null
+                prob_sum = sorted_probs.sum(dim=-1, keepdim=True) + 1e-12
+                if (prob_sum < 1e-10).any():
+                    sorted_probs[:, 0] = 1.0
+                    prob_sum = sorted_probs.sum(dim=-1, keepdim=True)
+                
+                sorted_probs = sorted_probs / prob_sum
                 probs = torch.zeros_like(probs).scatter_(1, sorted_idx, sorted_probs)
+            
+            # Last check before sampling
+            if not torch.isfinite(probs).all() or (probs.sum(dim=-1) < 1e-10).any():
+                break
+            
             next_token = torch.multinomial(probs, num_samples=1)
+            next_token = torch.clamp(next_token, 0, vocab_size - 1)
+            
             input_ids = torch.cat([input_ids, next_token], dim=1)
-        return input_ids  # retourne tensor d'ids
+        
+        return input_ids
 
 
-def worker_init_fn(worker_id):
-    worker_seed = args.train_seed + worker_id
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-    torch.manual_seed(worker_seed)
+def make_worker_init_fn(base_seed):
+    def _worker_init_fn(worker_id):
+        seed = base_seed + worker_id
+        np.random.seed(seed)
+        random.seed(seed)
+        torch.manual_seed(seed)
+    return _worker_init_fn
+
     
 class StreamingDataset(torch.utils.data.IterableDataset):
     def __init__(self, path, tokenizer, block_size):
@@ -313,6 +350,16 @@ class StreamingDataset(torch.utils.data.IterableDataset):
                     yield x, y
                     buffer = buffer[1:]
 
+
+GLOBAL_WORKER_SEED = None  # set at the bottom
+
+def worker_init_fn(worker_id):
+    if GLOBAL_WORKER_SEED is not None:
+        seed = GLOBAL_WORKER_SEED + worker_id
+        np.random.seed(seed)
+        random.seed(seed)
+        torch.manual_seed(seed)
+  
 def make_lr_lambda(warmup_steps=2000, total_steps=None, lr_scale_min=0.1):
     if total_steps is None:
         total_steps = warmup_steps + 200_000  # fallback (large)
@@ -326,9 +373,7 @@ def make_lr_lambda(warmup_steps=2000, total_steps=None, lr_scale_min=0.1):
         cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
         return lr_scale_min + (1.0 - lr_scale_min) * cosine_decay
 
-    return _lambda
-  
-        
+    return _lambda  
 def save_checkpoint(model, optimizer, scheduler, epoch, global_step, best_val_loss):
     save_dir = os.path.join(args.model_name, "checkpoints", str(epoch))
     os.makedirs(save_dir, exist_ok=True)
@@ -456,7 +501,7 @@ def evaluate_prompt(model, tokenizer, eval_prompt, device, max_new_tokens=50):
 
 
 if __name__ == "__main__":
-                      
+    GLOBAL_WORKER_SEED = args.train_seed
     train_loader = DataLoader(
         StreamingDataset(datasets_path["train"], tokenizer, SEQ_LEN),
         batch_size=BATCH_SIZE,
@@ -524,7 +569,8 @@ if __name__ == "__main__":
         
         logging.info(f"Checkpoints loaded from {resume_checkpoint}")
         logging.info(f"Resuming training from {resume_checkpoint}")
-    
+    logging.info(f"Vocab size: {tokenizer.get_vocab_size()}")
+    print(f"Max token ID possible: {max(tokenizer.get_vocab().values())}")
     logging.info("Starting training...")
     os.makedirs(f"{args.model_name}", exist_ok=True)
     with open(f"{args.model_name}/config.json", "w") as f:

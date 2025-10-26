@@ -5,3 +5,4 @@ venv/
 
 logs/
 tokenizer.json
+myllm*

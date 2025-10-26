@@ -18,7 +18,7 @@ logging.basicConfig(
 def train_tokenizer(tokenizer_path, vocab_size):
     txt_for_tokenizer = dataset_manager.iter_txt_for_tokenizer()
 
-    tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
+    tokenizer = Tokenizer(BPE(unk_token="<UNK>"))
     trainer = BpeTrainer(
         vocab_size=vocab_size,
         show_progress=True,
@@ -28,6 +28,11 @@ def train_tokenizer(tokenizer_path, vocab_size):
     tokenizer.train_from_iterator(txt_for_tokenizer, trainer)
     tokenizer.save(tokenizer_path)
     logging.info(f"Tokenizer saved at {tokenizer_path}")
+    # CHECK POST-TRAINING
+    logging.info(f"Tokenizer saved at {tokenizer_path}")
+    logging.info(f"Vocab size: {tokenizer.get_vocab_size()}")
+    max_id = max(tokenizer.get_vocab().values())
+    logging.info(f"Max token ID: {max_id}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
