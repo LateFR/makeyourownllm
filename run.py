@@ -1,8 +1,10 @@
 import json
 import math
 import os
+import random
 import shutil
 import time
+import numpy as np
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -65,8 +67,10 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info(f"Using device: {device}")
 
-    datasets_path = {"train": "data/train.txt", "test": "data/test.txt", "val": "data/val.txt"}
-
+    
+    datasets_path = json.load(open(args.datasets_path, "r"))
+    if "train" not in datasets_path.keys() or "test" not in datasets_path.keys() or "val" not in datasets_path.keys():
+        raise ValueError(f"Invalid datasets_path: {args.datasets_path}. Must be a json file with the keys 'train', 'test', and 'val'")
         
     BATCH_SIZE = config["batch_size"]        
     SEQ_LEN = config["block_size"]           # block size
@@ -81,6 +85,16 @@ if __name__ == "__main__":
 
     EVAL_PROMPT = args.eval_prompt
     EVAL_MAX_NEW_TOKENS = args.eval_max_new_tokens
+    
+    seed = args.train_seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    logging.info(f"Training seed set to {seed}")
     
     if not args.tokenizer_path and not args.generate_tokenizer:
         raise ValueError("Please provide a tokenizer path with --tokenizer-path or generate one with --generate-tokenizer")
@@ -116,7 +130,8 @@ if __name__ == "__main__":
     if tokenizer_vocab_size != VOCAB_SIZE:
         logging.warning(f"The tokenizer vocab size ({tokenizer_vocab_size}) is different from the expected vocab size ({VOCAB_SIZE}). We'll use the tokenizer's vocab size.")
         VOCAB_SIZE = tokenizer_vocab_size
-        
+    
+    
 LOG_EVERY = 500
 
 class CausalSelfAttention(nn.Module):

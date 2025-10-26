@@ -1,0 +1,1 @@
+{"train": "data/train.txt", "test": "data/test.txt", "val": "data/val.txt"}
