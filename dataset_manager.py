@@ -14,6 +14,7 @@ def import_datasets(dataset_json_path = "datasets.json"):
     for element in datasets:
         if not "config" in element.keys():
             element["config"] = ""
+    
         data = Data(element["name"], element["config"], element["type"])
         data_instances.append(data)
         

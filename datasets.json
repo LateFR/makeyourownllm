@@ -1,8 +1,12 @@
-{"datasets": 
-    [
-        {"name": "blended_skill_talk", "type":"dialog"},
-        {"name": "OpenAssistant/oasst1", "type":"dialog"},
-        {"name": "allenai/prosocial-dialog", "type":"dialog"},
-        {"name": "wikitext", "config": "wikitext-103-raw-v1", "type":"text"}
-    ]
+{
+  "datasets": [
+    {"name": "OpenAssistant/oasst2", "type": "dialog"},
+    {"name": "HuggingFaceH4/ultrachat_200k", "type": "dialog"},
+    
+    {"name": "wikipedia", "config": "20220301.fr", "type": "text"},
+    {"name": "wikitext", "config": "wikitext-103-raw-v1", "type": "text"},
+
+    {"name":"Insta", "type":"dialog", "path": "data/output/insta.txt"},
+    {"name":"Journal", "type":"text", "path": "data/output/journal.txt"}
+  ]
 }

@@ -1,3 +1,4 @@
+import os
 from datasets import load_dataset
 import logging
 from tqdm import tqdm
@@ -8,10 +9,11 @@ logging.basicConfig(
     level=logging.INFO,
 )
 class Data:
-    def __init__(self, name, config, type):
+    def __init__(self, name, config, type, path=None):
         self.name = name
         self.config = config
         self.type = type
+        self.path = path # If path is not None, load from path
         
         self.train = []
         self.test = []
@@ -22,18 +24,39 @@ class Data:
         
         
     def load(self):
-        dataset = load_dataset(self.name, self.config)
-        
-        if "train" in dataset.keys():
-            self.train.append(dataset["train"])
-        if "test" in dataset.keys():
-            self.test.append(dataset["test"])
-        if "validation" in dataset.keys():
-            self.val.append(dataset["validation"])
+        if self.path:
+            if not self.path.endswith(".txt"):
+                raise ValueError(f"Invalid path: {self.path} must be a .txt file")
+            if not os.path.exists(self.path):
+                raise ValueError(f"File not found: {self.path}")
             
-        tqdm(f"{self.name} loaded")
+            with open(self.path, "r", encoding="utf-8") as f:
+                all_lines = [line.strip() for line in f if line.strip()]
+            
+            total = len(all_lines)
+            
+            # Split: 80% train, 10% val, 10% test
+            train_end = int(total * 0.8)
+            val_end = int(total * 0.9)
+            
+            self.train = [all_lines[:train_end]]  # ← Garder comme liste pour compatibilité
+            self.val = [all_lines[train_end:val_end]]
+            self.test = [all_lines[val_end:]]
+            
+            logger.info(f"Loaded {self.name} from file: {len(self.train[0])} train, {len(self.val[0])} val, {len(self.test[0])} test")
+        
+        else:
+            dataset = load_dataset(self.name, self.config)
+            
+            if "train" in dataset.keys():
+                self.train.append(dataset["train"])
+            if "test" in dataset.keys():
+                self.test.append(dataset["test"])
+            if "validation" in dataset.keys():
+                self.val.append(dataset["validation"])
+        
         self.loaded = True
-        tqdm.write(f"{self.name} total size: {self.get_size()}")
+        logger.info(f"{self.name} total size: {self.get_size()}")
     
     def get_size(self):
         size = 0
