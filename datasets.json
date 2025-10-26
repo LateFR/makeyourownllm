@@ -1,12 +1,8 @@
 {
   "datasets": [
-    {"name": "OpenAssistant/oasst2", "type": "dialog"},
-    {"name": "HuggingFaceH4/ultrachat_200k", "type": "dialog"},
-    
-    {"name": "wikipedia", "config": "20220301.fr", "type": "text"},
-    {"name": "wikitext", "config": "wikitext-103-raw-v1", "type": "text"},
-
-    {"name":"Insta", "type":"dialog", "path": "data/output/insta.txt"},
-    {"name":"Journal", "type":"text", "path": "data/output/journal.txt"}
+    {"name": "wikitext", "config": "wikitext-103-raw-v1", "type": "text", "weight": 1.0},
+    {"name": "Insta", "type": "dialog", "path": "data/output/insta.txt", "weight": 2.0},
+    {"name": "Journal", "type": "text", "path": "data/output/journal.txt", "weight": 10.0},
+    {"name": "ChatGPT", "type": "dialog", "path": "data/output/chatgpt.txt", "weight": 1.0}
   ]
 }

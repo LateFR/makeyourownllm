@@ -28,7 +28,7 @@ if __name__ == "__main__":
     parser.add_argument("--reset", action="store_true", help="Reset the model current model and logs. To use if you had run the training script before and want to restart from scratch")
     parser.add_argument("--generate-tokenizer", action="store_true", help="Generate the tokenizer")
     parser.add_argument("--import-datasets", action="store_true", help="This will import the datasets from the datasets.json file, (downloading them from hungging face if necessary). Automatically called if --generate-tokenizer or --merge-datasets is used")
-    parser.add_argument("--merge-datasets", action="store_true", help="This will merge the datasets into 3 single files (train.txt, test.txt, val.txt). Needs to be run after importing datasets")
+    parser.add_argument("--merge-datasets", action="store_true", help="This will merge the datasets into 3 single files (train.txt, test.txt, val.txt). Needs to be run to train the model")
     parser.add_argument("--dataset-config-path", type=str, default="datasets.json", help="Path to the dataset configuration file")
     parser.add_argument("--dataset-path", type=str, default="cleans_datasets_path.json", help="Path to the json file containing the dataset paths")
     parser.add_argument("--dont-move-tokenizer", action="store_true", help="Don't move the tokenizer to the model directory")
