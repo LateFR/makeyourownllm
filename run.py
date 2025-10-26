@@ -12,24 +12,32 @@ import argparse
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 
-EVAL_PROMPT = "Once upon a time"
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", type=str, default="model")
     parser.add_argument("--tokenizer-path", type=str, default="tokenizer.json")
     parser.add_argument("--config-path", type=str, default="config.json")
-    parser.add_argument("--reset", action="store_true", help="Reset the model")
+    parser.add_argument("--reset", action="store_true", help="Reset the model current model and logs. To use if you had run the training script before and want to restart from scratch")
     parser.add_argument("--generate-tokenizer", action="store_true", help="Generate the tokenizer")
-    parser.add_argument("--import-datasets", action="store_true", help="This will import the datasets from the datasets.json file, (downloading them from hungging face if necessary)")
+    parser.add_argument("--import-datasets", action="store_true", help="This will import the datasets from the datasets.json file, (downloading them from hungging face if necessary). Automatically called if --generate-tokenizer or --merge-datasets is used")
     parser.add_argument("--merge-datasets", action="store_true", help="This will merge the datasets into 3 single files (train.txt, test.txt, val.txt). Needs to be run after importing datasets")
+    parser.add_argument("--dataset-config-path", type=str, default="datasets.json", help="Path to the dataset configuration file")
+    parser.add_argument("--dataset-path", type=str, default="data", help="Path to the dataset directory")
+    parser.add_argument("--dont-move-tokenizer", action="store_true", help="Don't move the tokenizer to the model directory")
+    parser.add_argument("--eval-prompt", type=str, default="Once upon a time", help="The prompt to use for evaluation")
+    parser.add_argument("--eval-max-new-tokens", type=int, default=50, help="The maximum number of new tokens to generate for evaluation")
+    
     args = parser.parse_args()
     
         
     log_file = f"logs/{args.model_name}.log"
     if args.reset:
-        os.remove(log_file)
-        shutil.rmtree(args.model_name, ignore_errors=True)
+        if os.path.exists(log_file):
+            os.remove(log_file)
+            logging.info(f"Log file {log_file} deleted")
+        if os.path.exists(args.model_name):
+            shutil.rmtree(args.model_name, ignore_errors=True)
+            logging.info(f"Model {args.model_name} deleted")
     os.makedirs("logs", exist_ok=True)
 
     logging.basicConfig(
@@ -67,9 +75,33 @@ if __name__ == "__main__":
     LR = config["lr"]          
     EPOCHS = config["epochs"]
 
+    EVAL_PROMPT = args.eval_prompt
+    EVAL_MAX_NEW_TOKENS = args.eval_max_new_tokens
+    
     if not args.tokenizer_path and not args.generate_tokenizer:
         raise ValueError("Please provide a tokenizer path with --tokenizer-path or generate one with --generate-tokenizer")
     
+    if args.generate_tokenizer:
+        import dataset_manager
+        import train_tokenizer
+        dataset_manager.import_datasets(args.dataset_path)
+        
+        train_tokenizer.train_tokenizer(args.tokenizer_path, VOCAB_SIZE)
+        
+    if args.import_datasets:
+        dataset_manager.import_datasets(args.dataset_config_path)
+    
+    if args.merge_datasets:
+        if not dataset_manager.data_instances:
+            dataset_manager.import_datasets(args.dataset_config_path)
+        dataset_manager.merge_and_write_datasets(args.dataset_path)
+        
+    if not args.dont_move_tokenizer:
+        logging.info(f"Moving tokenizer to {args.model_name}/tokenizer.json from {args.tokenizer_path} ...")
+        os.move(args.tokenizer_path, f"{args.model_name}/tokenizer.json")
+        logging.info(f"Tokenizer moved to {args.model_name}/tokenizer.json")
+        args.tokenizer_path = f"{args.model_name}/tokenizer.json"
+        
     tokenizer = Tokenizer.from_file(args.tokenizer_path)
     tokenizer_vocab_size = tokenizer.get_vocab_size()
     if tokenizer_vocab_size != VOCAB_SIZE:
@@ -303,7 +335,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, s
                 running_loss = 0.0
                 
             if (step + 1) % (LOG_EVERY*4) == 0 or step == 0:
-                generated = evaluate_prompt(model, tokenizer, EVAL_PROMPT, device)
+                generated = evaluate_prompt(model, tokenizer, EVAL_PROMPT, device, max_new_tokens=EVAL_MAX_NEW_TOKENS)
                 os.makedirs(f"{args.model_name}", exist_ok=True)
                 with open(f"{args.model_name}/eval_prompts.txt", "a", encoding="utf-8") as f:
                     f.write(generated + "\n")

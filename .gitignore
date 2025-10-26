@@ -3,4 +3,5 @@ data/
 checkpoints/
 venv/
 
+logs/
 tokenizer.json

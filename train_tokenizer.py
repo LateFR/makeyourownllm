@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 
 
-def generate_txt_for_tokenizer(tokenizer_path, vocab_size):
+def train_tokenizer(tokenizer_path, vocab_size):
     txt_for_tokenizer = dataset_manager.iter_txt_for_tokenizer()
 
     tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
