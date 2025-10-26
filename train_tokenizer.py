@@ -14,6 +14,21 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
+
+def generate_txt_for_tokenizer(tokenizer_path, vocab_size):
+    txt_for_tokenizer = dataset_manager.iter_txt_for_tokenizer()
+
+    tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
+    trainer = BpeTrainer(
+        vocab_size=vocab_size,
+        show_progress=True,
+        special_tokens=["<PAD>", "<BOS>", "<EOS>", "<SEP>", "<UNK>"]
+    )
+    tokenizer.pre_tokenizer = Whitespace()
+    tokenizer.train_from_iterator(txt_for_tokenizer, trainer)
+    tokenizer.save(tokenizer_path)
+    logging.info(f"Tokenizer saved at {tokenizer_path}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokenizer-path", type=str, default="tokenizer.json")
@@ -22,16 +37,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     dataset_manager.load_datasets()
-    
-txt_for_tokenizer = dataset_manager.iter_txt_for_tokenizer()
-
-tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
-trainer = BpeTrainer(
-    vocab_size=args.vocab_size,
-    show_progress=True,
-    special_tokens=["<PAD>", "<BOS>", "<EOS>", "<SEP>", "<UNK>"]
-)
-tokenizer.pre_tokenizer = Whitespace()
-tokenizer.train_from_iterator(txt_for_tokenizer, trainer)
-tokenizer.save(args.tokenizer_path)
-logging.info(f"Tokenizer saved at {args.tokenizer_path}")

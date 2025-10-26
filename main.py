@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import shutil
 import time
 from tqdm import tqdm
 import torch
@@ -19,14 +20,16 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer-path", type=str, default="tokenizer.json")
     parser.add_argument("--config-path", type=str, default="config.json")
     parser.add_argument("--reset", action="store_true", help="Reset the model")
-
+    parser.add_argument("--generate-tokenizer", action="store_true", help="Generate the tokenizer")
+    parser.add_argument("--import-datasets", action="store_true", help="This will import the datasets from the datasets.json file, (downloading them from hungging face if necessary)")
+    parser.add_argument("--merge-datasets", action="store_true", help="This will merge the datasets into 3 single files (train.txt, test.txt, val.txt). Needs to be run after importing datasets")
     args = parser.parse_args()
     
         
     log_file = f"logs/{args.model_name}.log"
     if args.reset:
         os.remove(log_file)
-        os.remove(args.model_name)
+        shutil.rmtree(args.model_name, ignore_errors=True)
     os.makedirs("logs", exist_ok=True)
 
     logging.basicConfig(
@@ -64,10 +67,17 @@ if __name__ == "__main__":
     LR = config["lr"]          
     EPOCHS = config["epochs"]
 
-    if not args.tokenizer_path:
-        raise ValueError("Please provide a tokenizer path with --tokenizer-path")
-    tokenizer = Tokenizer.from_file(args.tokenizer_path)
+    if not args.tokenizer_path and not args.generate_tokenizer:
+        raise ValueError("Please provide a tokenizer path with --tokenizer-path or generate one with --generate-tokenizer")
     
+    tokenizer = Tokenizer.from_file(args.tokenizer_path)
+    tokenizer_vocab_size = tokenizer.get_vocab_size()
+    if tokenizer_vocab_size != VOCAB_SIZE:
+        logging.warning(f"The tokenizer vocab size ({tokenizer_vocab_size}) is different from the expected vocab size ({VOCAB_SIZE}). We'll use the tokenizer's vocab size.")
+        VOCAB_SIZE = tokenizer_vocab_size
+        
+LOG_EVERY = 500
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, block_size):
         super().__init__()
@@ -253,27 +263,46 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, s
         start_time = time.time()
 
         for step, (x, y) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")):
+            max_y = int(y.max().item())
+            if max_y >= VOCAB_SIZE or y.min().item() < 0:
+                tqdm.write(f"[ERROR] target id out of range: max {max_y} >= vocab_size {VOCAB_SIZE}")
+                file_logger.error(f"Target id out of range: max {max_y} >= vocab_size {VOCAB_SIZE}")
+                continue
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             with autocast(device_type=device): # fp16
                 logits = model(x)
                 loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                
+                
+            if not torch.isfinite(loss):
+                tqdm.write(f"[WARN] non-finite loss at step {step}: {loss.item()}")
+                file_logger.warning(f"Non-finite loss at step {step}: {loss.item()}")
+                scaler.update()
+                continue
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
+            
+            try:
+                scaler.step(optimizer)
+            except Exception as e:
+                tqdm.write(f"[ERROR] scaler.step(optimizer) failed: {e}")
+                file_logger.error(f"scaler.step(optimizer) failed: {e}")
+                scaler.update()
+                continue
             scaler.update()
-            optimizer.step()
+            scheduler.step()
 
-            running_loss += loss.item()
+            running_loss += float(loss.detach().item())
 
-            if (step + 1) % 5000 == 0:
-                avg_loss = running_loss / 100
+            if (step + 1) % LOG_EVERY == 0:
+                avg_loss = running_loss / LOG_EVERY
                 tqdm.write(f"[Epoch {epoch}/{epochs}] Step {step+1} | Train loss: {avg_loss:.4f}")
                 file_logger.info(f"[Epoch {epoch}/{epochs}] Step {step+1} | Train loss: {avg_loss:.4f}")
                 running_loss = 0.0
                 
-            if (step + 1) % 20000 == 0 or step == 0:
+            if (step + 1) % (LOG_EVERY*4) == 0 or step == 0:
                 generated = evaluate_prompt(model, tokenizer, EVAL_PROMPT, device)
                 os.makedirs(f"{args.model_name}", exist_ok=True)
                 with open(f"{args.model_name}/eval_prompts.txt", "a", encoding="utf-8") as f:
@@ -321,6 +350,8 @@ def evaluate(model, dataloader, criterion, mode="Validation"):
 def evaluate_prompt(model, tokenizer, eval_prompt, device, max_new_tokens=50):
     model.eval()
     ids = tokenizer.encode(eval_prompt).ids
+    if len(ids) > SEQ_LEN:
+        ids = ids[-SEQ_LEN:] 
     input_ids = torch.tensor([ids], dtype=torch.long).to(device)
     out = model.generate(input_ids, max_new_tokens=max_new_tokens)
     decoded = tokenizer.decode(out[0].tolist())
