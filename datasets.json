@@ -1,8 +1,9 @@
 {
   "datasets": [
-    {"name": "wikitext", "config": "wikitext-103-raw-v1", "type": "text", "weight": 1.0},
-    {"name": "Insta", "type": "dialog", "path": "data/output/insta.txt", "weight": 2.0},
-    {"name": "Journal", "type": "text", "path": "data/output/journal.txt", "weight": 10.0},
-    {"name": "ChatGPT", "type": "dialog", "path": "data/output/chatgpt.txt", "weight": 1.0}
+    {"name": "OpenLLM-France/Claire-Dialogue-French-0.1", "type": "dialog", "weight": 1.0},
+    {"name": "wikipedia", "config": "20220301.fr", "type": "text", "split": "train[:8%]", "weight": 1.0},
+    {"name": "Insta", "type": "dialog", "path": "data/output/insta.txt", "weight": 100.0},
+    {"name": "Journal", "type": "text", "path": "data/output/journal.txt", "weight": 400.0},
+    {"name": "ChatGPT", "type": "dialog", "path": "data/output/chatgpt.txt", "weight": 5.0}
   ]
 }

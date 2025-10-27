@@ -4,5 +4,5 @@ checkpoints/
 venv/
 
 logs/
-tokenizer.json
+tokenizer*.json
 myllm*

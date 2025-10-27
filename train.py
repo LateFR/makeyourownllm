@@ -2,6 +2,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import time
 import numpy as np
@@ -13,6 +14,7 @@ import logging
 import argparse
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
+import dataset_manager
 logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -22,11 +24,12 @@ logging.basicConfig(
     )
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name", type=str, default="model")
+    parser.add_argument("model_name", type=str, help="Name of the model")
     parser.add_argument("--tokenizer-path", type=str, default="tokenizer.json")
     parser.add_argument("--config-path", type=str, default="config.json")
     parser.add_argument("--reset", action="store_true", help="Reset the model current model and logs. To use if you had run the training script before and want to restart from scratch")
     parser.add_argument("--generate-tokenizer", action="store_true", help="Generate the tokenizer")
+    parser.add_argument("--tokenizer-lang", type=str, default="en", choices=["fr", "en"], help="Language of the tokenizer. Don't support multilingual yet. Can be 'fr' or 'en'")
     parser.add_argument("--import-datasets", action="store_true", help="This will import the datasets from the datasets.json file, (downloading them from hungging face if necessary). Automatically called if --generate-tokenizer or --merge-datasets is used")
     parser.add_argument("--merge-datasets", action="store_true", help="This will merge the datasets into 3 single files (train.txt, test.txt, val.txt). Needs to be run to train the model")
     parser.add_argument("--dataset-config-path", type=str, default="datasets.json", help="Path to the dataset configuration file")
@@ -99,11 +102,10 @@ if __name__ == "__main__":
         raise ValueError("Please provide a tokenizer path with --tokenizer-path or generate one with --generate-tokenizer")
     
     if args.generate_tokenizer:
-        import dataset_manager
         import train_tokenizer
         dataset_manager.import_datasets(args.dataset_config_path)
         
-        train_tokenizer.train_tokenizer(args.tokenizer_path, VOCAB_SIZE)
+        train_tokenizer.train_tokenizer(args.tokenizer_path, VOCAB_SIZE, args.tokenizer_lang)
         
     if args.import_datasets:
         dataset_manager.import_datasets(args.dataset_config_path)
@@ -491,12 +493,18 @@ def evaluate_prompt(model, tokenizer, eval_prompt, device, max_new_tokens=50):
     model.eval()
     ids = tokenizer.encode(eval_prompt).ids
     if len(ids) > SEQ_LEN:
-        ids = ids[-SEQ_LEN:] 
+        ids = ids[-SEQ_LEN:]
     input_ids = torch.tensor([ids], dtype=torch.long).to(device)
-    
+
     result = model.generate(input_ids, max_new_tokens=max_new_tokens)
-    decoded = tokenizer.decode(result[0].tolist())
-    return decoded
+    decoded = tokenizer.decode(result[0].tolist(), skip_special_tokens=True)
+
+    # Nettoyage simple / sûr pour Metaspace markers
+    s = decoded.replace('▁', ' ')          # remplace le marker Metaspace par un espace
+    s = re.sub(r'\s+([.,;:!?%)»»›])', r'\1', s)   # retire espace avant ponctuation courante
+    s = re.sub(r'([(\[«‹])\s+', r'\1', s)         # retire espace après ouvrants éventuels
+    s = re.sub(r'\s{2,}', ' ', s).strip()         # compact multiple espaces
+    return s
 
 
 
